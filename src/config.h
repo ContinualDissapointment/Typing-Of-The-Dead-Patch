@@ -8,6 +8,8 @@ enum WindowMode {
     MODE_FULLSCREEN = 2
 };
 
+struct KeyRemap { DWORD src; DWORD dst; };
+
 struct Config {
     int        width;
     int        height;
@@ -16,6 +18,8 @@ struct Config {
     bool       keepAspect;        // only used when stretchToFit = false
     bool       pauseOnFocusLoss;  // true = suspend game loop when alt-tabbed
     bool       muteOnFocusLoss;   // true = mute audio when alt-tabbed
+    KeyRemap   remaps[32];
+    int        remapCount;
 };
 
 // Fills cfg from TOTDPatch.ini next to the DLL.

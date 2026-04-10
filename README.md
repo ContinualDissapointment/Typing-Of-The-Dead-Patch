@@ -35,6 +35,41 @@ The game uses Direct3D 7, which Windows 10/11 no longer provides a hardware devi
 
 ---
 
+## Key rebinding
+
+Single-key remappings are configured in the `[Controls]` section of `TOTDPatch.ini`. Any key can be remapped to any other key; the change affects both DirectInput and Win32 message input paths.
+
+```ini
+[Controls]
+; OriginalKey=NewKey
+F1=1
+F2=2
+F3=3
+F4=4
+PAUSE=P
+```
+
+Supported key names: `A`–`Z`, `0`–`9`, `F1`–`F12`, `ENTER`, `ESCAPE`, `SPACE`, `PAUSE`, `LEFT`, `RIGHT`, `UP`, `DOWN`, `TAB`, `BACKSPACE`, `DELETE`, `INSERT`, `HOME`, `END`, `PAGEUP`, `PAGEDOWN`, `NUMPAD0`–`NUMPAD9`, or raw hex VK codes (`0x70`).
+
+Note: combo keys (Alt+F2, Alt+F3, Alt+F4) cannot be remapped — only single-key bindings are supported.
+
+---
+
+## Hotkeys
+
+These work in `borderless` and `windowed` modes while the game is focused:
+
+| Hotkey | Action |
+|---|---|
+| **Ctrl+Shift+Left/Right** | Move window to the adjacent monitor (left/right) |
+| **Ctrl+Shift+Up/Down** | Move window to the adjacent monitor (above/below) |
+
+In `borderless` mode the window resizes to fill the destination monitor. In `windowed` mode it keeps its current size and centers on the destination monitor.
+
+> The Win key is suppressed by the game's DirectInput setup (`DISCL_NOWINKEY`), so the standard Windows shortcut (Win+Shift+Arrow) cannot be intercepted. Ctrl+Shift+Arrow is used instead.
+
+---
+
 ## Configuration (`TOTDPatch.ini`)
 
 ```ini

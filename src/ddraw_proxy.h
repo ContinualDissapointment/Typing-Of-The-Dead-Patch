@@ -5,6 +5,10 @@
 #include <ddraw.h>
 #include "config.h"
 
+// Patches the game exe's IAT to redirect GetAsyncKeyState / GetKeyState
+// through the remap table from cfg.  Call once after Config_Load.
+void ApplyInputRemaps(const Config& cfg);
+
 // Wraps IDirectDraw7.
 // Key intercepts:
 //   SetCooperativeLevel  -- ensures a valid HWND reaches dgVoodoo2 during enumeration;

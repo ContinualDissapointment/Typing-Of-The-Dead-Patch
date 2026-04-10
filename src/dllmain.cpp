@@ -209,9 +209,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hInst);
         Log_Init(hInst);
         Config_Load(g_cfg, hInst);
-        Log("DLL loaded. mode=%d width=%d height=%d stretch=%d aspect=%d",
+        Log("DLL loaded. mode=%d width=%d height=%d stretch=%d aspect=%d remaps=%d",
             (int)g_cfg.mode, g_cfg.width, g_cfg.height,
-            (int)g_cfg.stretchToFit, (int)g_cfg.keepAspect);
+            (int)g_cfg.stretchToFit, (int)g_cfg.keepAspect, g_cfg.remapCount);
+        ApplyInputRemaps(g_cfg);
         WriteDgVoodooConf(hInst, g_cfg);
         LoadRealDDraw();
         Log("Real ddraw loaded: %s", g_realDDraw ? "OK" : "FAILED");

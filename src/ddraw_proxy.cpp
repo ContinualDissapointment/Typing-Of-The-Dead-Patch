@@ -5,16 +5,103 @@
 #include <d3d.h>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
+#include <imagehlp.h>
+#pragma comment(lib, "imagehlp.lib")
 
 // ---------------------------------------------------------------------------
-// Window subclass — blocks WM_ACTIVATEAPP minimization in borderless mode
+// Window subclass — focus, pause/mute, and monitor-move hotkeys
 // ---------------------------------------------------------------------------
 
-static WNDPROC g_origWndProc      = nullptr;
-static bool    g_pauseOnFocusLoss = false;
-static bool    g_muteOnFocusLoss  = false;
-extern "C" volatile bool g_paused = false;
-static volatile bool     g_focused = true;
+static WNDPROC    g_origWndProc      = nullptr;
+static bool       g_pauseOnFocusLoss = false;
+static bool       g_muteOnFocusLoss  = false;
+static WindowMode g_windowMode       = MODE_BORDERLESS;
+extern "C" volatile bool g_paused    = false;
+static volatile bool     g_focused   = true;
+
+static HWND     g_gameHwnd     = nullptr;
+static HHOOK    g_kbHook       = nullptr;
+static DWORD    g_hookThreadId = 0;
+static bool     g_injecting    = false; // true only while we're calling SendInput
+static KeyRemap g_remaps[32];
+static int      g_remapCount   = 0;
+
+static DWORD FindRemap(DWORD vk)
+{
+    for (int i = 0; i < g_remapCount; ++i)
+        if (g_remaps[i].src == vk) return g_remaps[i].dst;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Monitor-walk helper for Win+Shift+Arrow
+// ---------------------------------------------------------------------------
+
+struct MonitorSearchCtx {
+    RECT     current;
+    int      dir;       // 0=left 1=right 2=up 3=down
+    HMONITOR best;
+    RECT     bestRect;
+    int      bestDist;
+};
+
+static BOOL CALLBACK FindAdjacentMonitorCb(HMONITOR hMon, HDC, LPRECT pRect, LPARAM lp)
+{
+    MonitorSearchCtx* c = (MonitorSearchCtx*)lp;
+    if (EqualRect(pRect, &c->current)) return TRUE;
+    int dist = INT_MAX;
+    switch (c->dir)
+    {
+    case 0: if (pRect->right  <= c->current.left)  dist = c->current.left  - pRect->right;  break;
+    case 1: if (pRect->left   >= c->current.right) dist = pRect->left   - c->current.right; break;
+    case 2: if (pRect->bottom <= c->current.top)   dist = c->current.top   - pRect->bottom; break;
+    case 3: if (pRect->top    >= c->current.bottom)dist = pRect->top    - c->current.bottom;break;
+    }
+    if (dist < c->bestDist) { c->bestDist = dist; c->best = hMon; c->bestRect = *pRect; }
+    return TRUE;
+}
+
+static void MoveWindowToAdjacentMonitor(HWND hwnd, int dir)
+{
+    HMONITOR hCur = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(hCur, &mi);
+
+    MonitorSearchCtx ctx = {};
+    ctx.current  = mi.rcMonitor;
+    ctx.dir      = dir;
+    ctx.best     = nullptr;
+    ctx.bestDist = INT_MAX;
+    EnumDisplayMonitors(nullptr, nullptr, FindAdjacentMonitorCb, (LPARAM)&ctx);
+
+    if (!ctx.best) return;
+
+    MONITORINFO miDst = { sizeof(miDst) };
+    GetMonitorInfo(ctx.best, &miDst);
+
+    if (g_windowMode == MODE_BORDERLESS)
+    {
+        // Fill the destination monitor completely
+        SetWindowPos(hwnd, nullptr,
+            miDst.rcMonitor.left, miDst.rcMonitor.top,
+            miDst.rcMonitor.right  - miDst.rcMonitor.left,
+            miDst.rcMonitor.bottom - miDst.rcMonitor.top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    else
+    {
+        // Keep window size, center on destination monitor work area
+        RECT wr; GetWindowRect(hwnd, &wr);
+        int w = wr.right  - wr.left;
+        int h = wr.bottom - wr.top;
+        RECT& wa = miDst.rcWork;
+        int x = wa.left + ((wa.right  - wa.left) - w) / 2;
+        int y = wa.top  + ((wa.bottom - wa.top)  - h) / 2;
+        SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+    }
+    Log("MoveWindowToAdjacentMonitor dir=%d -> (%d,%d)", dir,
+        miDst.rcMonitor.left, miDst.rcMonitor.top);
+}
 
 // ---------------------------------------------------------------------------
 // Audio mute helper — mutes/unmutes this process's WASAPI audio session(s)
@@ -77,10 +164,87 @@ static void SetProcessAudioMute(bool mute)
     Log("SetProcessAudioMute(%s)", mute ? "true" : "false");
 }
 
-// Watcher thread: when g_paused is set, suspends the main thread.
-// Polls GetForegroundWindow to detect focus return, then resumes.
+// ---------------------------------------------------------------------------
+// Low-level keyboard hook — intercepts Win+Shift+Arrow before the system
+// ---------------------------------------------------------------------------
 
-static LRESULT CALLBACK BorderlessWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+
+    if (nCode != HC_ACTION || !g_gameHwnd)
+        return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+
+    // Skip only keys that WE injected — not all injected keys.
+    // (dgVoodoo2 re-injects all input via SendInput, so LLKHF_INJECTED
+    //  is set on every keystroke the game sees.)
+    if (g_injecting)
+        return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+
+    // --- Key remapping --------------------------------------------------
+    if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
+        wParam == WM_KEYUP   || wParam == WM_SYSKEYUP)
+    {
+        DWORD dst = FindRemap(kb->vkCode);
+        if (dst)
+        {
+            Log("Hook: remap 0x%02X -> 0x%02X", kb->vkCode, dst);
+            INPUT inp = {};
+            inp.type       = INPUT_KEYBOARD;
+            inp.ki.wVk     = (WORD)dst;
+            inp.ki.dwFlags = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
+                             ? KEYEVENTF_KEYUP : 0;
+            g_injecting = true;
+            SendInput(1, &inp, sizeof(INPUT));
+            g_injecting = false;
+            return 1;
+        }
+    }
+
+    // --- Monitor switching (Ctrl+Shift+Arrow) ---------------------------
+    if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+    {
+        bool ctrlDown  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool shiftDown = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
+
+        if (ctrlDown && shiftDown)
+        {
+            int dir = -1;
+            if (kb->vkCode == VK_LEFT)  dir = 0;
+            if (kb->vkCode == VK_RIGHT) dir = 1;
+            if (kb->vkCode == VK_UP)    dir = 2;
+            if (kb->vkCode == VK_DOWN)  dir = 3;
+
+            if (dir >= 0)
+            {
+                Log("Hook: Ctrl+Shift+Arrow dir=%d -> posting WM_APP+1", dir);
+                PostMessageA(g_gameHwnd, WM_APP + 1, (WPARAM)dir, 0);
+                return 1;
+            }
+        }
+    }
+
+    return CallNextHookEx(g_kbHook, nCode, wParam, lParam);
+}
+
+// Dedicated thread: installs the LL hook then sits in GetMessage.
+// WH_KEYBOARD_LL requires its installing thread to have a live message loop —
+// if the game thread stalls, the hook times out and stops firing.
+static DWORD WINAPI HookThread(LPVOID)
+{
+    g_kbHook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
+    Log("HookThread: kbhook=%s", g_kbHook ? "ok" : "FAILED");
+    MSG m;
+    while (GetMessageA(&m, nullptr, 0, 0))
+    {
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+    if (g_kbHook) { UnhookWindowsHookEx(g_kbHook); g_kbHook = nullptr; }
+    return 0;
+}
+
+static LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == WM_ACTIVATEAPP)
     {
@@ -90,15 +254,123 @@ static LRESULT CALLBACK BorderlessWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         {
             if (g_pauseOnFocusLoss) g_paused = true;
             if (g_muteOnFocusLoss)  SetProcessAudioMute(true);
-            return 0;  // eat — prevents DirectDraw minimizing window
+            // Borderless only: eat the message to prevent DirectDraw minimizing the window
+            if (g_windowMode == MODE_BORDERLESS) return 0;
         }
         else
         {
-            g_paused = false;  // clear pause on focus return
-            if (g_muteOnFocusLoss)  SetProcessAudioMute(false);
+            g_paused = false;
+            if (g_muteOnFocusLoss) SetProcessAudioMute(false);
         }
     }
+
+    if (msg == WM_APP + 1)
+    {
+        Log("GameWndProc: WM_APP+1 dir=%d", (int)wParam);
+        MoveWindowToAdjacentMonitor(hwnd, (int)wParam);
+        return 0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        Log("GameWndProc: WM_DESTROY — killing hook thread");
+        if (g_hookThreadId) { PostThreadMessageA(g_hookThreadId, WM_QUIT, 0, 0); g_hookThreadId = 0; }
+        g_gameHwnd = nullptr;
+    }
+
     return CallWindowProcA(g_origWndProc, hwnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// IAT patching — redirect GetAsyncKeyState / GetKeyState in the game exe
+// ---------------------------------------------------------------------------
+
+typedef SHORT (WINAPI* PFN_GetAsyncKeyState)(int);
+typedef SHORT (WINAPI* PFN_GetKeyState)(int);
+
+static PFN_GetAsyncKeyState g_realGetAsyncKeyState = nullptr;
+static PFN_GetKeyState      g_realGetKeyState      = nullptr;
+
+static SHORT WINAPI Hook_GetAsyncKeyState(int vKey)
+{
+    DWORD dst = FindRemap((DWORD)vKey);
+    if (dst) vKey = (int)dst;
+    return g_realGetAsyncKeyState(vKey);
+}
+
+static SHORT WINAPI Hook_GetKeyState(int vKey)
+{
+    DWORD dst = FindRemap((DWORD)vKey);
+    if (dst) vKey = (int)dst;
+    return g_realGetKeyState(vKey);
+}
+
+// Patch one IAT entry in hMod's import table.
+// Finds the first thunk for dllName!procName and overwrites it with newFn.
+// If oldFn is non-null, stores the original pointer there.
+// Returns true on success.
+static bool PatchIATEntry(HMODULE hMod, const char* dllName, const char* procName,
+                          void* newFn, void** oldFn)
+{
+    ULONG size = 0;
+    PIMAGE_IMPORT_DESCRIPTOR pImport = (PIMAGE_IMPORT_DESCRIPTOR)
+        ImageDirectoryEntryToData(hMod, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &size);
+    if (!pImport) return false;
+
+    BYTE* base = (BYTE*)hMod;
+
+    for (; pImport->Name; ++pImport)
+    {
+        const char* name = (const char*)(base + pImport->Name);
+        if (_stricmp(name, dllName) != 0) continue;
+
+        PIMAGE_THUNK_DATA pOrig = (PIMAGE_THUNK_DATA)(base + pImport->OriginalFirstThunk);
+        PIMAGE_THUNK_DATA pThunk= (PIMAGE_THUNK_DATA)(base + pImport->FirstThunk);
+
+        for (; pOrig->u1.AddressOfData; ++pOrig, ++pThunk)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL(pOrig->u1.Ordinal)) continue;
+            PIMAGE_IMPORT_BY_NAME pByName =
+                (PIMAGE_IMPORT_BY_NAME)(base + pOrig->u1.AddressOfData);
+            if (_stricmp((const char*)pByName->Name, procName) != 0) continue;
+
+            // Found it — unprotect the page and overwrite
+            DWORD oldProt = 0;
+            VirtualProtect(&pThunk->u1.Function, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt);
+            if (oldFn) *oldFn = (void*)pThunk->u1.Function;
+            pThunk->u1.Function = (ULONG_PTR)newFn;
+            VirtualProtect(&pThunk->u1.Function, sizeof(void*), oldProt, &oldProt);
+            Log("PatchIAT: %s!%s -> %p (was %p)", dllName, procName, newFn,
+                oldFn ? *oldFn : nullptr);
+            return true;
+        }
+    }
+    return false;
+}
+
+void ApplyInputRemaps(const Config& cfg)
+{
+    if (cfg.remapCount == 0) return;
+
+    // Populate globals so Hook_* can use FindRemap
+    g_remapCount = cfg.remapCount;
+    for (int i = 0; i < cfg.remapCount; ++i) g_remaps[i] = cfg.remaps[i];
+
+    HMODULE hExe = GetModuleHandleA(nullptr);
+
+    bool ok1 = PatchIATEntry(hExe, "user32.dll", "GetAsyncKeyState",
+                             (void*)Hook_GetAsyncKeyState, (void**)&g_realGetAsyncKeyState);
+    bool ok2 = PatchIATEntry(hExe, "user32.dll", "GetKeyState",
+                             (void*)Hook_GetKeyState,      (void**)&g_realGetKeyState);
+
+    // Fallback: if the game imports from a differently-cased DLL name
+    if (!ok1) ok1 = PatchIATEntry(hExe, "USER32.DLL", "GetAsyncKeyState",
+                                  (void*)Hook_GetAsyncKeyState, (void**)&g_realGetAsyncKeyState);
+    if (!ok2) ok2 = PatchIATEntry(hExe, "USER32.DLL", "GetKeyState",
+                                  (void*)Hook_GetKeyState,      (void**)&g_realGetKeyState);
+
+    Log("ApplyInputRemaps: remaps=%d GetAsyncKeyState=%s GetKeyState=%s",
+        cfg.remapCount, ok1 ? "patched" : "not found", ok2 ? "patched" : "not found");
 }
 
 // ---------------------------------------------------------------------------
@@ -224,25 +496,26 @@ HRESULT STDMETHODCALLTYPE ProxyDDraw7::SetCooperativeLevel(HWND hwnd, DWORD flag
     HRESULT hr = m_real->SetCooperativeLevel(hwndCoop, flags);
     Log("  flags=0x%08X -> 0x%08X", flags, (unsigned)hr);
 
-    if (SUCCEEDED(hr) && hwnd && m_cfg.mode == MODE_BORDERLESS)
+    if (SUCCEEDED(hr) && hwnd && m_cfg.mode != MODE_FULLSCREEN)
     {
-        // Subclass the window to suppress WM_ACTIVATEAPP minimization.
-        // DirectDraw sets exclusive mode which causes the game window to minimize
-        // on alt-tab — eating that message keeps it visible.
         if (!g_origWndProc)
         {
             g_pauseOnFocusLoss = m_cfg.pauseOnFocusLoss;
             g_muteOnFocusLoss  = m_cfg.muteOnFocusLoss;
+            g_windowMode       = m_cfg.mode;
+            g_gameHwnd    = hwnd;
+            g_remapCount  = m_cfg.remapCount;
+            for (int i = 0; i < m_cfg.remapCount; ++i) g_remaps[i] = m_cfg.remaps[i];
             g_origWndProc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC,
-                                                        (LONG_PTR)BorderlessWndProc);
-            Log("  subclassed HWND (pauseOnFocusLoss=%d muteOnFocusLoss=%d)",
-                (int)g_pauseOnFocusLoss, (int)g_muteOnFocusLoss);
+                                                        (LONG_PTR)GameWndProc);
+            HANDLE hThread = CreateThread(nullptr, 0, HookThread, nullptr, 0, &g_hookThreadId);
+            if (hThread) CloseHandle(hThread);
+            Log("  subclassed HWND mode=%d (pause=%d mute=%d remaps=%d hookThread=%u)",
+                (int)m_cfg.mode, (int)g_pauseOnFocusLoss, (int)g_muteOnFocusLoss,
+                g_remapCount, g_hookThreadId);
         }
         ApplyWindowStyle();
     }
-
-    if (SUCCEEDED(hr) && hwnd && m_cfg.mode == MODE_WINDOWED)
-        ApplyWindowStyle();
 
     ShowCursor(TRUE);
     return hr;
